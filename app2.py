@@ -17,13 +17,17 @@ st.set_page_config(
 # --- SEGREDOS E CONEXÃO ---
 # Certifique-se de configurar .streamlit/secrets.toml com:
 # [supabase]
-# url = "SUA_URL_SUPABASE"
-# anon_key = "SUA_ANON_KEY"
-# db_url = "postgresql://postgres.tnt...:senha@aws-0-sa-east-1.pooler.supabase.com:5432/postgres"
+# url = "..."
+# anon_key = "..."
+# db_url = "..."
 
-SUPABASE_URL = st.secrets["supabase"]["url"]
-SUPABASE_KEY = st.secrets["supabase"]["anon_key"]
-DATABASE_URL = st.secrets["supabase"]["db_url"]
+try:
+    SUPABASE_URL = st.secrets["supabase"]["url"]
+    SUPABASE_KEY = st.secrets["supabase"]["anon_key"]
+    DATABASE_URL = st.secrets["supabase"]["db_url"]
+except KeyError:
+    st.error("Configuração de secrets incompleta. Verifique o arquivo .streamlit/secrets.toml")
+    st.stop()
 
 # Cache da conexão SQL
 @st.cache_resource
@@ -38,7 +42,17 @@ def sb_login(email, password):
         resp = httpx.post(url, headers=headers, json={"email": email, "password": password}, timeout=10)
         resp.raise_for_status()
         return resp.json()
+    except httpx.HTTPStatusError as e:
+        # Tenta ler a mensagem de erro detalhada do Supabase
+        try:
+            err_json = e.response.json()
+            msg = err_json.get("error_description") or err_json.get("msg") or e.response.text
+            st.error(f"Erro de Login: {msg}")
+        except:
+            st.error(f"Erro HTTP: {e}")
+        return None
     except Exception as e:
+        st.error(f"Erro de conexão: {e}")
         return None
 
 def get_user_profile(user_id, token):
@@ -54,13 +68,6 @@ def get_user_profile(user_id, token):
         return {"role": "student", "nome": "Aluno", "user_id": user_id}
     except:
         return {"role": "student", "nome": "Aluno", "user_id": user_id}
-
-def create_student_user(email, password, nome, teacher_token):
-    # Cria usuário no Auth (Requer Service Role ou config especifica, 
-    # aqui usaremos uma logica simplificada de 'convite' ou criação manual no painel 
-    # para não expor a service key no front).
-    st.warning("Para criar usuários, use o Painel do Supabase ou configure a Service Key nos secrets.")
-    return False
 
 # --- FUNÇÕES DE DADOS (SQL) ---
 def run_query(query, params=None):
@@ -103,8 +110,7 @@ if not st.session_state.auth:
                     "nome": profile.get("nome", "Aluno")
                 }
                 st.rerun()
-            else:
-                st.error("E-mail ou senha inválidos.")
+            # Se falhar, o erro já será exibido dentro da função sb_login
     st.stop()
 
 # --- UI: APLICAÇÃO PRINCIPAL ---
@@ -127,19 +133,22 @@ target_user_name = user["nome"]
 if is_teacher:
     with st.expander("👥 Selecionar Aluno (Visão do Professor)", expanded=False):
         # Busca todos os alunos
-        alunos_df = run_query("SELECT * FROM profiles WHERE role = 'student'")
-        if not alunos_df.empty:
-            aluno_opts = {row["nome"]: row["user_id"] for i, row in alunos_df.iterrows()}
-            sel_aluno = st.selectbox("Visualizar dados de:", ["(Eu mesmo)"] + list(aluno_opts.keys()))
-            
-            if sel_aluno != "(Eu mesmo)":
-                target_user_id = aluno_opts[sel_aluno]
-                target_user_name = sel_aluno
-        else:
-            st.info("Nenhum aluno cadastrado.")
+        try:
+            alunos_df = run_query("SELECT * FROM profiles WHERE role = 'student'")
+            if not alunos_df.empty:
+                aluno_opts = {row["nome"]: row["user_id"] for i, row in alunos_df.iterrows()}
+                sel_aluno = st.selectbox("Visualizar dados de:", ["(Eu mesmo)"] + list(aluno_opts.keys()))
+                
+                if sel_aluno != "(Eu mesmo)":
+                    target_user_id = aluno_opts[sel_aluno]
+                    target_user_name = sel_aluno
+            else:
+                st.info("Nenhum aluno cadastrado na tabela profiles.")
+        except Exception as e:
+            st.error(f"Erro ao buscar alunos: {e}")
 
 # --- ABAS DE NAVEGAÇÃO (Melhor para celular) ---
-tab_dash, tab_treino, tab_aval, tab_conta = st.tabs(["📊 Dash", "💪 Treinos", "a📏 Avaliação", "⚙️ Conta"])
+tab_dash, tab_treino, tab_aval, tab_conta = st.tabs(["📊 Dash", "💪 Treinos", "📏 Avaliação", "⚙️ Conta"])
 
 # =========================================================
 # TAB 1: DASHBOARD
@@ -147,35 +156,49 @@ tab_dash, tab_treino, tab_aval, tab_conta = st.tabs(["📊 Dash", "💪 Treinos"
 with tab_dash:
     st.caption(f"Visualizando dados de: **{target_user_name}**")
     
-    # Busca última avaliação
-    df_av = run_query("""
-        SELECT * FROM avaliacoes 
-        WHERE user_id = :uid 
-        ORDER BY data DESC
-    """, {"uid": target_user_id})
+    try:
+        # Busca última avaliação
+        df_av = run_query("""
+            SELECT * FROM avaliacoes 
+            WHERE user_id = :uid 
+            ORDER BY data DESC
+        """, {"uid": target_user_id})
 
-    if not df_av.empty:
-        last = df_av.iloc[0]
-        prev = df_av.iloc[1] if len(df_av) > 1 else None
-        
-        # Métricas (Cards)
-        k1, k2, k3 = st.columns(3)
-        
-        def safe_delta(curr, prev_val):
-            if prev_val is None: return None
-            return f"{curr - prev_val:.1f}"
+        if not df_av.empty:
+            last = df_av.iloc[0]
+            prev = df_av.iloc[1] if len(df_av) > 1 else None
+            
+            # Métricas (Cards)
+            k1, k2, k3 = st.columns(3)
+            
+            def safe_delta(curr, prev_val):
+                if prev_val is None or pd.isna(prev_val): return None
+                return f"{curr - prev_val:.1f}"
 
-        k1.metric("Peso", f"{last['peso']} kg", safe_delta(last['peso'], prev['peso'] if prev is not None else None))
-        k2.metric("% Gordura", f"{last['percentual_gordura']}%", safe_delta(last['percentual_gordura'], prev['percentual_gordura'] if prev is not None else None), delta_color="inverse")
-        k3.metric("Massa Magra", f"{last['percentual_massa_magra']}%", safe_delta(last['percentual_massa_magra'], prev['percentual_massa_magra'] if prev is not None else None))
+            peso_val = float(last['peso']) if pd.notna(last['peso']) else 0.0
+            gord_val = float(last['percentual_gordura']) if pd.notna(last['percentual_gordura']) else 0.0
+            mm_val = float(last['percentual_massa_magra']) if pd.notna(last['percentual_massa_magra']) else 0.0
 
-        # Gráficos (Plotly Mobile Friendly)
-        st.divider()
-        fig = px.line(df_av, x="data", y=["peso", "percentual_gordura"], markers=True, title="Evolução Corporal")
-        fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Nenhuma avaliação registrada para este usuário.")
+            peso_prev = float(prev['peso']) if prev is not None and pd.notna(prev['peso']) else None
+            gord_prev = float(prev['percentual_gordura']) if prev is not None and pd.notna(prev['percentual_gordura']) else None
+            mm_prev = float(prev['percentual_massa_magra']) if prev is not None and pd.notna(prev['percentual_massa_magra']) else None
+
+            k1.metric("Peso", f"{peso_val} kg", safe_delta(peso_val, peso_prev))
+            k2.metric("% Gordura", f"{gord_val}%", safe_delta(gord_val, gord_prev), delta_color="inverse")
+            k3.metric("Massa Magra", f"{mm_val}%", safe_delta(mm_val, mm_prev))
+
+            # Gráficos (Plotly Mobile Friendly)
+            st.divider()
+            if len(df_av) > 1:
+                fig = px.line(df_av, x="data", y=["peso", "percentual_gordura"], markers=True, title="Evolução Corporal")
+                fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Registre mais avaliações para ver o gráfico de evolução.")
+        else:
+            st.info("Nenhuma avaliação registrada para este usuário.")
+    except Exception as e:
+        st.error(f"Erro ao carregar dashboard: {e}")
 
 # =========================================================
 # TAB 2: TREINOS
@@ -183,8 +206,7 @@ with tab_dash:
 with tab_treino:
     st.caption(f"Histórico de: **{target_user_name}**")
     
-    # Botão de Novo Treino (Apenas Professor ou o próprio usuário se permitido)
-    # Aqui assumimos que Aluno também pode registrar seu treino do dia
+    # Botão de Novo Treino
     with st.expander("➕ Registrar Novo Treino"):
         with st.form("form_treino"):
             d_treino = st.date_input("Data", value=date.today())
@@ -214,18 +236,20 @@ with tab_treino:
 
     # Lista de Treinos Recentes
     st.subheader("Últimos Treinos")
-    df_treinos = run_query("""
-        SELECT data, grupo_muscular, exercicio, series, repeticoes, carga_kg 
-        FROM treinos 
-        WHERE user_id = :uid 
-        ORDER BY data DESC LIMIT 50
-    """, {"uid": target_user_id})
-    
-    if not df_treinos.empty:
-        # Formatação para mobile: Data como index ou agrupamento
-        st.dataframe(df_treinos, use_container_width=True, hide_index=True)
-    else:
-        st.write("Sem histórico.")
+    try:
+        df_treinos = run_query("""
+            SELECT data, grupo_muscular, exercicio, series, repeticoes, carga_kg 
+            FROM treinos 
+            WHERE user_id = :uid 
+            ORDER BY data DESC LIMIT 20
+        """, {"uid": target_user_id})
+        
+        if not df_treinos.empty:
+            st.dataframe(df_treinos, use_container_width=True, hide_index=True)
+        else:
+            st.write("Sem histórico.")
+    except Exception as e:
+        st.error(f"Erro ao carregar treinos: {e}")
 
 # =========================================================
 # TAB 3: AVALIAÇÃO FÍSICA
@@ -242,17 +266,22 @@ with tab_aval:
                 mm_av = c2.number_input("% Massa Magra", 0.0)
                 
                 if st.form_submit_button("Salvar Avaliação"):
-                    execute_statement("""
-                        INSERT INTO avaliacoes (user_id, data, peso, altura, percentual_gordura, percentual_massa_magra)
-                        VALUES (:uid, :dt, :p, :a, :g, :m)
-                    """, {"uid": target_user_id, "dt": dt_av, "p": peso_av, "a": alt_av, "g": gord_av, "m": mm_av})
-                    st.success("Avaliação salva!")
-                    st.rerun()
+                    try:
+                        execute_statement("""
+                            INSERT INTO avaliacoes (user_id, data, peso, altura, percentual_gordura, percentual_massa_magra)
+                            VALUES (:uid, :dt, :p, :a, :g, :m)
+                        """, {"uid": target_user_id, "dt": dt_av, "p": peso_av, "a": alt_av, "g": gord_av, "m": mm_av})
+                        st.success("Avaliação salva!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
+    else:
+        st.info("Apenas professores podem cadastrar avaliações.")
     
     # Tabela detalhada
     st.subheader("Histórico Completo")
-    if not df_av.empty:
-        st.dataframe(df_av, use_container_width=True)
+    if 'df_av' in locals() and not df_av.empty:
+        st.dataframe(df_av, use_container_width=True, hide_index=True)
     else:
         st.write("Nenhuma avaliação.")
 
@@ -262,14 +291,17 @@ with tab_aval:
 with tab_conta:
     st.markdown("### Configurações")
     if is_teacher:
-        st.info("Você é um **Professor**. Você pode ver e editar dados de todos os alunos.")
-        
-        st.markdown("#### Cadastrar Novo Aluno")
-        st.caption("Para criar alunos, acesse o painel do Supabase > Authentication > Users.")
-        
+        st.success("Logado como: **Professor**")
+        st.info("Você tem permissão para ver e editar dados de todos os alunos.")
+        st.markdown("---")
+        st.markdown("**Como cadastrar um novo aluno:**")
+        st.markdown("1. Vá ao painel do Supabase > Authentication > Users > Add User.")
+        st.markdown("2. Vá ao Table Editor > profiles > Insira o ID do usuário criado, defina role='student' e o nome.")
     else:
-        st.info("Você é um **Aluno**. Você visualiza seus próprios dados.")
+        st.success("Logado como: **Aluno**")
+        st.info("Você está visualizando seus próprios dados.")
         
-    if st.button("Logout"):
+    st.markdown("---")
+    if st.button("Sair (Logout)"):
         st.session_state.auth = None
         st.rerun()
